@@ -3,18 +3,13 @@ import os
 import logging
 from typing import List, Dict
 
-# --- NEUE v1.0 IMPORTE ---
-# Core
+# --- v1.0 IMPORTE (ALLE KORRIGIERT) ---
 from langchain_core.prompts import PromptTemplate
 from langchain_core.runnables import RunnablePassthrough, RunnableLambda
 from langchain_core.output_parsers import StrOutputParser
-# LLM (ChatOllama statt Ollama)
 from langchain_ollama import ChatOllama
-# Embeddings
 from langchain_huggingface import HuggingFaceEmbeddings
-# Vektor-Datenbank
 from langchain_chroma import Chroma
-# Dokumenten-Lader & Splitter
 from langchain_community.document_loaders import JSONLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
@@ -26,7 +21,9 @@ OLLAMA_MODEL_NAME = "llama3"
 
 # --- Logging einschalten, um die generierten Queries zu sehen ---
 logging.basicConfig()
-logging.getLogger("langchain.retrievers.multi_query").setLevel(logging.INFO)
+logger = logging.getLogger(__name__)
+# Setze das Level auf INFO, um die generierten Suchen zu sehen
+logger.setLevel(logging.INFO) 
 
 # --- FUNKTIONEN (Bleiben gleich) ---
 
@@ -44,92 +41,94 @@ def load_documents_from_jsonl(file_path):
     return documents
 
 def create_vector_db(documents, embedding_model, persist_directory):
-    # Diese Funktion wird jetzt nicht mehr gebraucht, da die DB existiert,
-    # aber wir lassen sie für zukünftige Updates drin.
-    print("Starte Text-Splitting...")
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1500, chunk_overlap=200)
-    splits = text_splitter.split_documents(documents)
-    print(f"Dokumente in {len(splits)} Abschnitte (Chunks) aufgeteilt.")
-    print(f"Erstelle Vektor-Datenbank in '{PERSIST_DIRECTORY}'...")
-    vectorstore = Chroma.from_documents(
-        documents=splits, embedding=embedding_model, persist_directory=PERSIST_DIRECTORY
-    )
-    print("Vektor-Datenbank erfolgreich erstellt und gespeichert.")
-    return vectorstore
+    # Wird nicht mehr gebraucht, aber bleibt für Vollständigkeit
+    pass 
 
-# --- v1.0 RAG-KETTE (DEIN SYNTHESIZER) ---
+# --- v6.0 RAG-KETTE (DEIN SYNTHESIZER mit Deutsch-Zwang) ---
 
 def get_smart_rag_chain(vectorstore, llm):
     """
-    Baut die RAG-Kette mit DEINER "Query-Morphing"-Idee,
-    aber mit reiner v1.0-Architektur (LCEL).
+    Baut die RAG-Kette mit DEINER "Query-Morphing"-Idee (v1.0).
     """
     
     # --- 1. DER QUERY-MORPHING-PROMPT (Problem 2 Fix) ---
     query_expansion_prompt_template = """
-Du bist ein juristischer Assistent. Deine Aufgabe ist es, eine Benutzerfrage
-in 3 alternative, spezifische Suchanfragen für eine Vektordatenbank
-umzuwandeln. Die Suchen sollten relevante juristische Keywords
-und Synonyme (z.B. für "Haftung" auch "Verantwortlichkeit", "Sorgfaltspflicht")
-verwenden, um implizite Informationen zu finden.
+Du bist ein juristischer Assistent für deutsches/Liechtensteiner Recht.
+Deine Aufgabe ist es, eine Benutzerfrage in 3 alternative, spezifische
+Suchanfragen für eine Vektordatenbank umzuwandeln.
 
-Liefere NUR die 3 Suchanfragen, getrennt durch einen Zeilenumbruch.
-KEINE Einleitung, KEINE Nummerierung.
+**WICHTIGE REGELN:**
+1.  **SPRACHE:** Die Suchanfragen MÜSSEN zu 100% auf **DEUTSCH** sein.
+2.  **KEYWORDS:** Verwende relevante juristische Keywords und Synonyme
+    (z.B. für "Haftung" auch "Verantwortlichkeit", "Sorgfaltspflicht").
+3.  **FORMAT:** Liefere NUR die 3 Suchanfragen, getrennt durch einen Zeilenumbruch.
+4.  **VERBOTEN:** KEINE Einleitung, KEINE Nummerierung, KEINE englischen Wörter.
+
+**BEISPIEL:**
+FRAGE:
+Haftung Liquidatoren
+SUCHANFRAGEN (nur Deutsch):
+Verantwortlichkeit der Liquidatoren bei einer AG
+Sorgfaltspflichten der Liquidationsorgane
+Haftungsfolgen für Liquidatoren bei Liquidation
 
 FRAGE:
 {question}
 
-SUCHANFRAGEN:
+SUCHANFRAGEN (nur Deutsch):
 """
     query_expansion_prompt = PromptTemplate(
         template=query_expansion_prompt_template, input_variables=["question"]
     )
 
     # --- 2. DER "MULTI-QUERY"-PROZESS (Der v1.0-Weg) ---
-    
-    # Basis-Retriever
-    retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
+    retriever = vectorstore.as_retriever(search_kwargs={"k": 7}) # Holen wir 7 Chunks
 
-    # Diese Kette generiert die 3 Suchanfragen
     query_generation_chain = (
         query_expansion_prompt
         | llm
         | StrOutputParser()
-        | (lambda x: x.split("\n")) # Wandelt den Text-Output in eine Liste von Strings um
+        | (lambda x: x.split("\n")) 
     )
 
     def retrieve_docs_for_queries(queries: List[str]) -> List[Dict]:
         """Nimmt eine Liste von Anfragen, führt Suchen für jede aus und gibt einzigartige Docs zurück."""
-        print(f"INFO: Generierte Suchanfragen: {queries}")
+        logger.info(f"Generierte Suchanfragen (v6.0 German-Fix):\n{queries}")
+        
         all_docs = []
         for query in queries:
-            if query.strip(): # Nur wenn die Zeile nicht leer ist
+            if query.strip(): 
                 all_docs.extend(retriever.invoke(query))
         
         # De-duplizieren (basierend auf dem Inhalt)
         unique_docs = {doc.page_content: doc for doc in all_docs}.values()
         return list(unique_docs)
 
-    # Das ist jetzt der "Retriever"-Teil unserer Kette:
-    # Es nimmt die "question", generiert Queries, holt Dokumente
     smart_retriever_chain = query_generation_chain | RunnableLambda(retrieve_docs_for_queries)
 
-    # --- 3. DER FINALE ANTWORT-PROMPT (Problem 1 Fix) ---
+    # --- 3. DER FINALE ANTWORT-PROMPT (Problem 1 Fix + Glossar) ---
     final_response_template = """
 Du bist ein hochpräziser juristischer Assistent für das Recht im Fürstentum Liechtenstein.
-Antworte auf die Frage des Benutzers präzise und AUSSCHLIESSLICH basierend auf dem folgenden Kontext.
-Antworte auf Deutsch.
+Du antwortest IMMER auf Deutsch.
 
-**WICHTIGE REGELN:**
-1.  **Quellenpflicht:** Jede Antwort MUSS mit einer Quellenangabe enden.
-    (Quelle: DATEINAME.pdf) oder (Quellen: DATEI1.pdf, DATEI2.pdf)
-2.  **Synthese-Hinweis (DEIN VORSCHLAG):** Wenn die Antwort eine Synthese aus
-    verschiedenen Quellen ist, die das Thema nur implizit oder am Rande behandeln,
-    leite die Antwort ein mit: 
+**JURISTISCHES GLOSSAR:**
+* **PGR:** Personen- und Gesellschaftsrecht
+* **EO:** Exekutionsordnung
+* **OGH:** Oberster Gerichtshof
+* **VGH:** Verwaltungsgerichtshof
+* **STGH:** Staatsgerichtshof
+
+**DEINE AUFGABE:**
+Beantworte die "FRAGE" des Benutzers.
+
+**STRIKTE REGELN:**
+1.  **AUSSCHLIESSLICHKEIT:** Deine Antwort darf AUSSCHLIESSLICH auf den Informationen im "KONTEXT" basieren.
+2.  **KEINE HALLUZINATION:** Wenn der "KONTEXT" die Frage nicht beantwortet, antworte *exakt* und *nur* mit dem Satz:
+    "Ich konnte in den vorliegenden 217 Urteilen keine Informationen zu dieser Frage finden."
+3.  **SYNTHESE (DEINE IDEE):** Wenn die Antwort eine Synthese aus mehreren Quellen ist (weil die Frage nur implizit beantwortet wird), leite die Antwort ein mit:
     "Basierend auf einer Synthese der vorliegenden Urteile, die sich implizit mit dem Thema befassen, gilt folgendes:"
-3.  **Keine Antwort:** Wenn der Kontext absolut KEINE Relevanz zur Frage hat,
-    antworte mit:
-    "Ich konnte in den vorliegenden 217 Urteilen keine spezifischen oder impliziten Informationen zu dieser Frage finden."
+4.  **QUELLENPFLICHT:** JEDE Antwort (außer der "Keine Antwort"-Satz) MUSS mit den genauen Quellenangaben enden.
+    (Quelle: DATEINAME.pdf) oder (Quellen: DATEI1.pdf, DATEI2.pdf)
 
 KONTEXT:
 {context}
@@ -137,16 +136,28 @@ KONTEXT:
 FRAGE:
 {question}
 
-PRÄZISE ANTWORT (inkl. Zitat und ggf. Synthese-Hinweis):
+PRÄZISE ANTWORT (auf Deutsch, basierend auf Regeln 1-4):
 """
     final_response_prompt = PromptTemplate(template=final_response_template, input_variables=["context", "question"])
 
     def format_docs(docs):
-        chunks = []
+        # Wir filtern Duplikate und fügen Quellen hinzu
+        chunks = {}
+        unique_sources = set()
+        context_str = ""
+        
         for doc in docs:
             source = doc.metadata.get('source', 'Unbekannt')
-            chunks.append(f"--- Quelle: {source} ---\n{doc.page_content}")
-        return "\n\n".join(chunks)
+            if source not in chunks:
+                 chunks[source] = []
+            chunks[source].append(doc.page_content)
+            unique_sources.add(source)
+
+        for source in unique_sources:
+            context_str += f"\n--- Quelle: {source} ---\n"
+            context_str += "\n...\n".join(chunks[source])
+            
+        return context_str
 
     # --- 4. DIE FINALE v1.0 KETTE ---
     rag_chain = (
@@ -161,11 +172,10 @@ PRÄZISE ANTWORT (inkl. Zitat und ggf. Synthese-Hinweis):
     
     return rag_chain
 
-# --- HAUPTSKRIPT (Jetzt mit v1.0-Importen) ---
+# --- HAUPTSKRIPT (v1.0-Importe) ---
 
 def main():
     print("Lade Embedding-Modell (v1.0)...")
-    # NEUER v1.0 IMPORT
     embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL_NAME)
     
     if not os.path.exists(PERSIST_DIRECTORY):
@@ -173,7 +183,6 @@ def main():
         return
     else:
         print(f"Lade existierende Vektor-DB aus '{PERSIST_DIRECTORY}' (v1.0)...")
-        # NEUER v1.0 IMPORT
         vectorstore = Chroma(
             persist_directory=PERSIST_DIRECTORY,
             embedding_function=embeddings
@@ -181,8 +190,6 @@ def main():
 
     print(f"Lade LLM '{OLLAMA_MODEL_NAME}' via Ollama (v1.0)...")
     try:
-        # --- HIER IST DER FIX ---
-        # NEUER v1.0 IMPORT: Es heißt ChatOllama, nicht Ollama
         llm = ChatOllama(model=OLLAMA_MODEL_NAME) 
         llm.invoke("Hallo") 
     except Exception as e:
@@ -193,7 +200,7 @@ def main():
 
     rag_chain = get_smart_rag_chain(vectorstore, llm)
     
-    print("\n--- PAlpine RAG-System (Prototyp v4.1 - 'Der 1.0-Fix') ---")
+    print("\n--- PAlpine RAG-System (Prototyp v6.0 - 'Der Deutsche Synthesizer') ---")
     print("Stelle deine Fragen an die Urteile. (Beenden mit 'exit')")
     
     while True:
