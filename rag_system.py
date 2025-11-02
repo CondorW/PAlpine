@@ -2,159 +2,127 @@ import json
 import os
 import logging
 from typing import List, Dict
+from langchain_core.documents import Document
 
-# --- v1.0 IMPORTE (ALLE KORRIGIERT) ---
-from langchain_core.prompts import PromptTemplate
-from langchain_core.runnables import RunnablePassthrough, RunnableLambda
+from langchain_core.prompts import PromptTemplate, ChatPromptTemplate
+from langchain_core.runnables import RunnablePassthrough, RunnableLambda, RunnableParallel
 from langchain_core.output_parsers import StrOutputParser
 from langchain_ollama import ChatOllama
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
-# (DocumentLoader und Splitter werden hier nicht mehr gebraucht)
 
-# --- KONFIGURATION ---
-# (MUSS mit build_database.py übereinstimmen)
-PERSIST_DIRECTORY = "db"
-EMBEDDING_MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2" # Besser für Deutsch!
-OLLAMA_MODEL_NAME = "llama3" 
-RETRIEVER_K_VALUE = 10 # Mehr kleinere Chunks abrufen
+# --- KONFIGURATION (v9.2 - Parallel-Abruf) ---
+PERSIST_DIRECTORY_LAWS = "db_laws"
+PERSIST_DIRECTORY_JUDGMENTS = "db_judgments"
+EMBEDDING_MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+OLLAMA_MODEL_NAME = "command-r7b" 
 
-# --- Logging einschalten, um die generierten Queries zu sehen ---
+# Anzahl der abgerufenen Dokumente
+LAW_RETRIEVER_K = 10
+JUDGMENT_RETRIEVER_K = 10
+
+# --- Logging ---
 logging.basicConfig()
 logger = logging.getLogger(__name__)
-# Setze das Level auf INFO, um die generierten Suchen zu sehen
 logger.setLevel(logging.INFO) 
 
-# --- FUNKTIONEN (Vereinfacht) ---
-# load_documents... und create_vector_db... sind jetzt in build_database.py
-
-# --- v7.0 RAG-KETTE (Mit Chunking-Fix) ---
-
-def get_smart_rag_chain(vectorstore, llm):
-    """
-    Baut die RAG-Kette mit DEINER "Query-Morphing"-Idee (v1.0).
-    """
+def format_docs_with_sources(docs: List[Document]) -> str:
+    """Formatiert Dokumente und fügt Quellenangaben hinzu."""
+    chunks = {}
+    unique_sources = set()
+    context_str = ""
     
-    # --- 1. DER QUERY-MORPHING-PROMPT (Bleibt gleich, ist gut) ---
-    query_expansion_prompt_template = """
-Du bist ein juristischer Assistent für deutsches/Liechtensteiner Recht.
-Deine Aufgabe ist es, eine Benutzerfrage in 3 alternative, spezifische
-Suchanfragen für eine Vektordatenbank umzuwandeln.
+    for doc in docs:
+        source = doc.metadata.get('source', 'Unbekannt')
+        if source not in chunks:
+             chunks[source] = []
+        chunks[source].append(doc.page_content)
+        unique_sources.add(source)
 
-**WICHTIGE REGELN:**
-1.  **SPRACHE:** Die Suchanfragen MÜSSEN zu 100% auf **DEUTSCH** sein.
-2.  **KEYWORDS:** Verwende relevante juristische Keywords und Synonyme
-    (z.B. für "Haftung" auch "Verantwortlichkeit", "Sorgfaltspflicht").
-3.  **FORMAT:** Liefere NUR die 3 Suchanfragen, getrennt durch einen Zeilenumbruch.
-4.  **VERBOTEN:** KEINE Einleitung, KEINE Nummerierung, KEINE englischen Wörter.
-
-**BEISPIEL:**
-FRAGE:
-Haftung Liquidatoren
-SUCHANFRAGEN (nur Deutsch):
-Verantwortlichkeit der Liquidatoren bei einer AG
-Sorgfaltspflichten der Liquidationsorgane
-Haftungsfolgen für Liquidatoren bei Liquidation
-
-FRAGE:
-{question}
-
-SUCHANFRAGEN (nur Deutsch):
-"""
-    query_expansion_prompt = PromptTemplate(
-        template=query_expansion_prompt_template, input_variables=["question"]
-    )
-
-    # --- 2. DER "MULTI-QUERY"-PROZESS (v1.0) ---
-    # Wir holen jetzt mehr (k=10) Chunks, da diese jetzt kleiner und relevanter sind.
-    retriever = vectorstore.as_retriever(search_kwargs={"k": RETRIEVER_K_VALUE}) 
-
-    query_generation_chain = (
-        query_expansion_prompt
-        | llm
-        | StrOutputParser()
-        | (lambda x: x.split("\n")) 
-    )
-
-    def retrieve_docs_for_queries(queries: List[str]) -> List[Dict]:
-        """Nimmt eine Liste von Anfragen, führt Suchen für jede aus und gibt einzigartige Docs zurück."""
-        logger.info(f"Generierte Suchanfragen (v7.0 German-Fix):\n{queries}")
+    for source in sorted(list(unique_sources)):
+        context_str += f"\n--- Quelle: {source} ---\n"
+        context_str += "\n...\n".join(chunks[source])
         
-        all_docs = []
-        for query in queries:
-            if query.strip(): 
-                all_docs.extend(retriever.invoke(query))
-        
-        # De-duplizieren (basierend auf dem Inhalt)
-        unique_docs = {doc.page_content: doc for doc in all_docs}.values()
-        logger.info(f"{len(unique_docs)} einzigartige Chunks werden an das LLM gesendet.")
-        return list(unique_docs)
+    return context_str
 
-    smart_retriever_chain = query_generation_chain | RunnableLambda(retrieve_docs_for_queries)
+def get_pgr_rag_chain(law_retriever, judgment_retriever, llm):
+    """
+    Baut die RAG-Kette (v9.2) nach der "Anwalts-Logik":
+    1. Finde Gesetze (parallel).
+    2. Finde Urteile (parallel).
+    3. Synthetisiere die Antwort (getrennt).
+    """
 
-    # --- 3. DER FINALE ANTWORT-PROMPT (Problem 2 Fix + Glossar) ---
+    # --- 1. PROMPT: FINALE ANTWORT-SYNTHESE (Unverändert) ---
     final_response_template = """
 Du bist ein hochpräziser juristischer Assistent für das Recht im Fürstentum Liechtenstein.
-Du antwortest IMMER auf Deutsch.
-
-**JURISTISCHES GLOSSAR:**
-* **PGR:** Personen- und Gesellschaftsrecht
-* **ABGB:** Allgemeines bürgerliches Gesetzbuch
-* **EO:** Exekutionsordnung
-* **ZPO:** Zivilprozessordnung
-* **OGH:** Oberster Gerichtshof
-* **VGH:** Verwaltungsgerichtshof
-* **STGH:** Staatsgerichtshof
+Du antwortest IMMER auf Deutsch und befolgst die "TERMINOLOGIE-PFLICHT".
 
 **DEINE AUFGABE:**
-Beantworte die "FRAGE" des Benutzers.
+Beantworte die "FRAGE" des Benutzers, indem du die bereitgestellten Kontexte nutzt.
 
-**STRIKTE REGELN:**
-1.  **AUSSCHLIESSLICHKEIT:** Deine Antwort darf AUSSCHLIESSLICH auf den Informationen im "KONTEXT" basieren.
-2.  **KEINE HALLUZINATION (VERBESSERT):** Wenn der "KONTEXT" die Frage nicht beantwortet, antworte *exakt* und *nur* mit dem Satz:
+**STRIKTE REGELN ZUR ANTWORT-STRUKTUR:**
+1.  **STRUKTUR:** Du MUSST die Antwort klar strukturieren:
+    * Beginne mit der Überschrift: "I. Gesetzliche Regelung"
+    * Erkläre die Gesetzeslage AUSSCHLIESSLICH basierend auf dem "GESETZES-KONTEXT".
+    * Füge dann die Überschrift hinzu: "II. Relevante Judikatur"
+    * Ergänze die Antwort mit relevanten Urteilen AUSSCHLIESSLICH aus dem "JUDIKATUR-KONTEXT".
+2.  **AUSSCHLIESSLICHKEIT:** Deine Antwort darf AUSSCHLIESSLICH auf den Informationen 
+    in den "GESETZES-KONTEXT" und "JUDIKATUR-KONTEXT" basieren.
+3.  **KEINE HALLUZINATION:** Wenn *beide* Kontexte die Frage nicht beantworten, antworte *exakt* und *nur* mit dem Satz:
     "Ich konnte in den vorliegenden Dokumenten (Urteile und Gesetze) keine Informationen zu dieser Frage finden."
-3.  **SYNTHESE:** Wenn die Antwort eine Synthese aus mehreren Quellen ist (weil die Frage nur implizit beantwortet wird), leite die Antwort ein mit:
-    "Basierend auf einer Synthese der vorliegenden Dokumente, die sich implizit mit dem Thema befassen, gilt folgendes:"
-4.  **QUELLENPFLICHT:** JEDE Antwort (außer der "Keine Antwort"-Satz) MUSS mit den genauen Quellenangaben enden.
-    (Quelle: DATEINAME.pdf) oder (Quellen: DATEI1.pdf, DATEI2.pdf)
+4.  **QUELLENPFLICHT:** JEDE Information MUSS mit der genauen Quelle (z.B. (Quelle: LILEX_PGR.pdf) 
+    oder (Quelle: 05CG2021179_8346_251101034656.pdf)) belegt werden.
+5.  **TERMINOLOGIE-PFLICHT:** Verwende AUSSCHLIESSLICH die exakten juristischen Begriffe 
+    (z.B. "Stiftungsrat" statt "Vorstand").
 
-KONTEXT:
-{context}
+---
+**GESETZES-KONTEXT:**
+{law_context}
+---
+**JUDIKATUR-KONTEXT:**
+{judgment_context}
+---
 
-FRAGE:
+**FRAGE:**
 {question}
 
-PRÄZISE ANTWORT (auf Deutsch, basierend auf Regeln 1-4):
+**PRÄZISE, STRUKTURIERTE ANTWORT (auf Deutsch, basierend auf Regeln 1-5):**
 """
-    final_response_prompt = PromptTemplate(template=final_response_template, input_variables=["context", "question"])
+    final_response_prompt = ChatPromptTemplate.from_template(final_response_template)
 
-    def format_docs(docs):
-        # Wir filtern Duplikate und fügen Quellen hinzu
-        chunks = {}
-        unique_sources = set()
-        context_str = ""
-        
-        for doc in docs:
-            # Holen der Metadaten, die wir in build_database.py gespeichert haben
-            source = doc.metadata.get('source', 'Unbekannt')
-            if source not in chunks:
-                 chunks[source] = []
-            chunks[source].append(doc.page_content)
-            unique_sources.add(source)
+    # --- 2. DIE RETRIEVER-KETTEN (Parallel) ---
+    
+    # Kette 1: Holt Gesetze und formatiert sie
+    law_chain = (
+        RunnableLambda(lambda x: x['question']) 
+        | law_retriever 
+        | format_docs_with_sources
+    )
+    
+    # Kette 2: Holt Urteile und formatiert sie
+    judgment_chain = (
+        RunnableLambda(lambda x: x['question']) 
+        | judgment_retriever 
+        | format_docs_with_sources
+    )
 
-        for source in sorted(list(unique_sources)):
-            context_str += f"\n--- Quelle: {source} ---\n"
-            # Füge alle Chunks aus dieser Quelle zusammen
-            context_str += "\n...\n".join(chunks[source])
-            
-        return context_str
-
-    # --- 4. DIE FINALE v7.0 KETTE ---
-    rag_chain = (
+    # --- 3. DIE FINALE v9.2 KETTE (PARALLEL) ---
+    
+    # Wir erstellen ein "Dictionary", das parallel ausgeführt wird.
+    # 'law_context' wird mit Kette 1 gefüllt.
+    # 'judgment_context' wird mit Kette 2 gefüllt.
+    parallel_retrieval = RunnableParallel(
         {
-            "context": RunnableLambda(lambda x: x['question']) | smart_retriever_chain | format_docs,
-            "question": RunnableLambda(lambda x: x['question'])
+            "law_context": law_chain,
+            "judgment_context": judgment_chain,
+            "question": RunnablePassthrough(lambda x: x['question'])
         }
+    )
+
+    # Die Hauptkette
+    rag_chain = (
+        parallel_retrieval
         | final_response_prompt
         | llm
         | StrOutputParser()
@@ -162,10 +130,11 @@ PRÄZISE ANTWORT (auf Deutsch, basierend auf Regeln 1-4):
     
     return rag_chain
 
-# --- HAUPTSKRIPT (Angepasst) ---
+# --- HAUPTSKRIPT (Unverändert) ---
+# (Lädt bereits beide DBs, was perfekt für die neue Kette ist)
 
 def main():
-    print("Lade Embedding-Modell (v7.0)...")
+    print("Lade Embedding-Modell (v9.2)...")
     model_kwargs = {'device': 'cpu'}
     encode_kwargs = {'normalize_embeddings': False}
     embeddings = HuggingFaceEmbeddings(
@@ -174,31 +143,46 @@ def main():
         encode_kwargs=encode_kwargs
     )
     
-    if not os.path.exists(PERSIST_DIRECTORY):
-        print(f"!! FEHLER: Datenbank-Ordner '{PERSIST_DIRECTORY}' nicht gefunden.")
-        print("!! Bitte führe zuerst das Skript 'build_database.py' aus, um die Vektor-DB zu erstellen.")
+    # Lade Gesetzes-DB
+    if not os.path.exists(PERSIST_DIRECTORY_LAWS):
+        print(f"!! FEHLER: Gesetzes-DB '{PERSIST_DIRECTORY_LAWS}' nicht gefunden.")
+        print("!! Bitte führe zuerst 'build_database.py' (v9.0+) aus.")
         return
     else:
-        print(f"Lade existierende Vektor-DB aus '{PERSIST_DIRECTORY}' (v7.0)...")
-        vectorstore = Chroma(
-            persist_directory=PERSIST_DIRECTORY,
+        print(f"Lade Gesetzes-DB aus '{PERSIST_DIRECTORY_LAWS}'...")
+        law_vectorstore = Chroma(
+            persist_directory=PERSIST_DIRECTORY_LAWS,
             embedding_function=embeddings
         )
+        law_retriever = law_vectorstore.as_retriever(search_kwargs={"k": LAW_RETRIEVER_K})
 
+    # Lade Urteils-DB
+    if not os.path.exists(PERSIST_DIRECTORY_JUDGMENTS):
+        print(f"!! FEHLER: Urteils-DB '{PERSIST_DIRECTORY_JUDGMENTS}' nicht gefunden.")
+        print("!! Bitte führe zuerst 'build_database.py' (v9.0+) aus.")
+        return
+    else:
+        print(f"Lade Urteils-DB aus '{PERSIST_DIRECTORY_JUDGMENTS}'...")
+        judgment_vectorstore = Chroma(
+            persist_directory=PERSIST_DIRECTORY_JUDGMENTS,
+            embedding_function=embeddings
+        )
+        judgment_retriever = judgment_vectorstore.as_retriever(search_kwargs={"k": JUDGMENT_RETRIEVER_K})
+
+    # Lade LLM
     print(f"Lade LLM '{OLLAMA_MODEL_NAME}' via Ollama...")
     try:
         llm = ChatOllama(model=OLLAMA_MODEL_NAME) 
         llm.invoke("Hallo") 
     except Exception as e:
-        print("\n\n!! FEHLER: Konnte keine Verbindung zu Ollama herstellen.")
-        print("Bitte stelle sicher, dass Ollama läuft (z.B. mit 'sudo systemctl start ollama' oder 'ollama serve').")
-        print(f"Python-Fehler: {e}")
+        print(f"\n\n!! FEHLER: Konnte keine Verbindung zu Ollama herstellen: {e}")
         return
 
-    rag_chain = get_smart_rag_chain(vectorstore, llm)
+    # Erstelle die neue RAG-Kette
+    rag_chain = get_pgr_rag_chain(law_retriever, judgment_retriever, llm)
     
-    print("\n--- PAlpine RAG-System (v7.0 - 'Der Präzisions-Synthesizer') ---")
-    print("Stelle deine Fragen an die Urteile UND Gesetze. (Beenden mit 'exit')")
+    print(f"\n--- PAlpine RAG-System (v9.2 - 'Parallel-Assistent') ---")
+    print("Stelle deine Fragen. (Beenden mit 'exit')")
     
     while True:
         try:
@@ -209,7 +193,7 @@ def main():
             if not query:
                 continue
 
-            print("Suche (Stufe 1: v1.0 Query-Expansion)...")
+            print("Suche (Parallel: Gesetze & Judikatur)...")
             response = rag_chain.invoke({"question": query}) 
             
             print("\nANTWORT:")

@@ -3,8 +3,11 @@ from langchain_core.runnables import Runnable
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
 from langchain_ollama import ChatOllama
-from rag_system import get_smart_rag_chain, PERSIST_DIRECTORY, EMBEDDING_MODEL_NAME, OLLAMA_MODEL_NAME
+from rag_system import get_smart_rag_chain, PERSIST_DIRECTORY, EMBEDDING_MODEL_NAME
 import os
+
+# HIER IST DIE ÄNDERUNG
+OLLAMA_MODEL_NAME = "command-r7b"
 
 # --- Hilfsfunktionen & Caching ---
 
@@ -57,14 +60,14 @@ def get_cached_rag_chain() -> Runnable:
     if not vectorstore or not llm:
         st.stop()
         
-    st.success("RAG-System ist bereit.")
+    st.success(f"RAG-System ist bereit (Modell: {OLLAMA_MODEL_NAME}).")
     return get_smart_rag_chain(vectorstore, llm)
 
 # --- Streamlit UI ---
 
 st.set_page_config(page_title="PAlpine RAG", layout="wide")
 st.title("PAlpine RAG 🏔️ - Juristisches Assistenzsystem")
-st.markdown("Prototyp v7.0 - Stellt Fragen an die Liechtensteiner Urteile und Gesetze (PGR, ABGB, EO, ZPO).")
+st.markdown("Prototyp v8.0 - Stellt Fragen an die Liechtensteiner Urteile und Gesetze (PGR, ABGB, EO, ZPO).")
 
 # Initialisiere die RAG-Kette
 try:
@@ -93,7 +96,7 @@ if prompt := st.chat_input("Stellen Sie Ihre juristische Frage..."):
     # Generiere und zeige Bot-Antwort
     with st.chat_message("assistant"):
         message_placeholder = st.empty()
-        with st.spinner("Suche in Urteilen und Gesetzen... (kann bis zu 30 Sek. dauern)"):
+        with st.spinner(f"Suche in Urteilen und Gesetzen... (Modell: {OLLAMA_MODEL_NAME})"):
             try:
                 # Hier rufen wir die Kette auf
                 response = rag_chain.invoke({"question": prompt})
