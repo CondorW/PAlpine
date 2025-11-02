@@ -10,14 +10,14 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_ollama import ChatOllama
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
-from langchain_community.document_loaders import JSONLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+# (DocumentLoader und Splitter werden hier nicht mehr gebraucht)
 
 # --- KONFIGURATION ---
-JSONL_FILE_PATH = "judgments.jsonl"
+# (MUSS mit build_database.py übereinstimmen)
 PERSIST_DIRECTORY = "db"
-EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+EMBEDDING_MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2" # Besser für Deutsch!
 OLLAMA_MODEL_NAME = "llama3" 
+RETRIEVER_K_VALUE = 10 # Mehr kleinere Chunks abrufen
 
 # --- Logging einschalten, um die generierten Queries zu sehen ---
 logging.basicConfig()
@@ -25,33 +25,17 @@ logger = logging.getLogger(__name__)
 # Setze das Level auf INFO, um die generierten Suchen zu sehen
 logger.setLevel(logging.INFO) 
 
-# --- FUNKTIONEN (Bleiben gleich) ---
+# --- FUNKTIONEN (Vereinfacht) ---
+# load_documents... und create_vector_db... sind jetzt in build_database.py
 
-def load_documents_from_jsonl(file_path):
-    print(f"Lade Dokumente aus {file_path}...")
-    loader = JSONLoader(
-        file_path=file_path, jq_schema='.', content_key="full_text", json_lines=True,
-        metadata_func=lambda record, metadata: {
-            "source": record.get("source_file"),
-            "case_number": record.get("case_number")
-        }
-    )
-    documents = loader.load()
-    print(f"{len(documents)} Dokumente erfolgreich geladen.")
-    return documents
-
-def create_vector_db(documents, embedding_model, persist_directory):
-    # Wird nicht mehr gebraucht, aber bleibt für Vollständigkeit
-    pass 
-
-# --- v6.0 RAG-KETTE (DEIN SYNTHESIZER mit Deutsch-Zwang) ---
+# --- v7.0 RAG-KETTE (Mit Chunking-Fix) ---
 
 def get_smart_rag_chain(vectorstore, llm):
     """
     Baut die RAG-Kette mit DEINER "Query-Morphing"-Idee (v1.0).
     """
     
-    # --- 1. DER QUERY-MORPHING-PROMPT (Problem 2 Fix) ---
+    # --- 1. DER QUERY-MORPHING-PROMPT (Bleibt gleich, ist gut) ---
     query_expansion_prompt_template = """
 Du bist ein juristischer Assistent für deutsches/Liechtensteiner Recht.
 Deine Aufgabe ist es, eine Benutzerfrage in 3 alternative, spezifische
@@ -81,8 +65,9 @@ SUCHANFRAGEN (nur Deutsch):
         template=query_expansion_prompt_template, input_variables=["question"]
     )
 
-    # --- 2. DER "MULTI-QUERY"-PROZESS (Der v1.0-Weg) ---
-    retriever = vectorstore.as_retriever(search_kwargs={"k": 7}) # Holen wir 7 Chunks
+    # --- 2. DER "MULTI-QUERY"-PROZESS (v1.0) ---
+    # Wir holen jetzt mehr (k=10) Chunks, da diese jetzt kleiner und relevanter sind.
+    retriever = vectorstore.as_retriever(search_kwargs={"k": RETRIEVER_K_VALUE}) 
 
     query_generation_chain = (
         query_expansion_prompt
@@ -93,7 +78,7 @@ SUCHANFRAGEN (nur Deutsch):
 
     def retrieve_docs_for_queries(queries: List[str]) -> List[Dict]:
         """Nimmt eine Liste von Anfragen, führt Suchen für jede aus und gibt einzigartige Docs zurück."""
-        logger.info(f"Generierte Suchanfragen (v6.0 German-Fix):\n{queries}")
+        logger.info(f"Generierte Suchanfragen (v7.0 German-Fix):\n{queries}")
         
         all_docs = []
         for query in queries:
@@ -102,18 +87,21 @@ SUCHANFRAGEN (nur Deutsch):
         
         # De-duplizieren (basierend auf dem Inhalt)
         unique_docs = {doc.page_content: doc for doc in all_docs}.values()
+        logger.info(f"{len(unique_docs)} einzigartige Chunks werden an das LLM gesendet.")
         return list(unique_docs)
 
     smart_retriever_chain = query_generation_chain | RunnableLambda(retrieve_docs_for_queries)
 
-    # --- 3. DER FINALE ANTWORT-PROMPT (Problem 1 Fix + Glossar) ---
+    # --- 3. DER FINALE ANTWORT-PROMPT (Problem 2 Fix + Glossar) ---
     final_response_template = """
 Du bist ein hochpräziser juristischer Assistent für das Recht im Fürstentum Liechtenstein.
 Du antwortest IMMER auf Deutsch.
 
 **JURISTISCHES GLOSSAR:**
 * **PGR:** Personen- und Gesellschaftsrecht
+* **ABGB:** Allgemeines bürgerliches Gesetzbuch
 * **EO:** Exekutionsordnung
+* **ZPO:** Zivilprozessordnung
 * **OGH:** Oberster Gerichtshof
 * **VGH:** Verwaltungsgerichtshof
 * **STGH:** Staatsgerichtshof
@@ -123,10 +111,10 @@ Beantworte die "FRAGE" des Benutzers.
 
 **STRIKTE REGELN:**
 1.  **AUSSCHLIESSLICHKEIT:** Deine Antwort darf AUSSCHLIESSLICH auf den Informationen im "KONTEXT" basieren.
-2.  **KEINE HALLUZINATION:** Wenn der "KONTEXT" die Frage nicht beantwortet, antworte *exakt* und *nur* mit dem Satz:
-    "Ich konnte in den vorliegenden 217 Urteilen keine Informationen zu dieser Frage finden."
-3.  **SYNTHESE (DEINE IDEE):** Wenn die Antwort eine Synthese aus mehreren Quellen ist (weil die Frage nur implizit beantwortet wird), leite die Antwort ein mit:
-    "Basierend auf einer Synthese der vorliegenden Urteile, die sich implizit mit dem Thema befassen, gilt folgendes:"
+2.  **KEINE HALLUZINATION (VERBESSERT):** Wenn der "KONTEXT" die Frage nicht beantwortet, antworte *exakt* und *nur* mit dem Satz:
+    "Ich konnte in den vorliegenden Dokumenten (Urteile und Gesetze) keine Informationen zu dieser Frage finden."
+3.  **SYNTHESE:** Wenn die Antwort eine Synthese aus mehreren Quellen ist (weil die Frage nur implizit beantwortet wird), leite die Antwort ein mit:
+    "Basierend auf einer Synthese der vorliegenden Dokumente, die sich implizit mit dem Thema befassen, gilt folgendes:"
 4.  **QUELLENPFLICHT:** JEDE Antwort (außer der "Keine Antwort"-Satz) MUSS mit den genauen Quellenangaben enden.
     (Quelle: DATEINAME.pdf) oder (Quellen: DATEI1.pdf, DATEI2.pdf)
 
@@ -147,19 +135,21 @@ PRÄZISE ANTWORT (auf Deutsch, basierend auf Regeln 1-4):
         context_str = ""
         
         for doc in docs:
+            # Holen der Metadaten, die wir in build_database.py gespeichert haben
             source = doc.metadata.get('source', 'Unbekannt')
             if source not in chunks:
                  chunks[source] = []
             chunks[source].append(doc.page_content)
             unique_sources.add(source)
 
-        for source in unique_sources:
+        for source in sorted(list(unique_sources)):
             context_str += f"\n--- Quelle: {source} ---\n"
+            # Füge alle Chunks aus dieser Quelle zusammen
             context_str += "\n...\n".join(chunks[source])
             
         return context_str
 
-    # --- 4. DIE FINALE v1.0 KETTE ---
+    # --- 4. DIE FINALE v7.0 KETTE ---
     rag_chain = (
         {
             "context": RunnableLambda(lambda x: x['question']) | smart_retriever_chain | format_docs,
@@ -172,23 +162,30 @@ PRÄZISE ANTWORT (auf Deutsch, basierend auf Regeln 1-4):
     
     return rag_chain
 
-# --- HAUPTSKRIPT (v1.0-Importe) ---
+# --- HAUPTSKRIPT (Angepasst) ---
 
 def main():
-    print("Lade Embedding-Modell (v1.0)...")
-    embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL_NAME)
+    print("Lade Embedding-Modell (v7.0)...")
+    model_kwargs = {'device': 'cpu'}
+    encode_kwargs = {'normalize_embeddings': False}
+    embeddings = HuggingFaceEmbeddings(
+        model_name=EMBEDDING_MODEL_NAME,
+        model_kwargs=model_kwargs,
+        encode_kwargs=encode_kwargs
+    )
     
     if not os.path.exists(PERSIST_DIRECTORY):
-        print(f"FEHLER: Datenbank-Ordner '{PERSIST_DIRECTORY}' nicht gefunden.")
+        print(f"!! FEHLER: Datenbank-Ordner '{PERSIST_DIRECTORY}' nicht gefunden.")
+        print("!! Bitte führe zuerst das Skript 'build_database.py' aus, um die Vektor-DB zu erstellen.")
         return
     else:
-        print(f"Lade existierende Vektor-DB aus '{PERSIST_DIRECTORY}' (v1.0)...")
+        print(f"Lade existierende Vektor-DB aus '{PERSIST_DIRECTORY}' (v7.0)...")
         vectorstore = Chroma(
             persist_directory=PERSIST_DIRECTORY,
             embedding_function=embeddings
         )
 
-    print(f"Lade LLM '{OLLAMA_MODEL_NAME}' via Ollama (v1.0)...")
+    print(f"Lade LLM '{OLLAMA_MODEL_NAME}' via Ollama...")
     try:
         llm = ChatOllama(model=OLLAMA_MODEL_NAME) 
         llm.invoke("Hallo") 
@@ -200,8 +197,8 @@ def main():
 
     rag_chain = get_smart_rag_chain(vectorstore, llm)
     
-    print("\n--- PAlpine RAG-System (Prototyp v6.0 - 'Der Deutsche Synthesizer') ---")
-    print("Stelle deine Fragen an die Urteile. (Beenden mit 'exit')")
+    print("\n--- PAlpine RAG-System (v7.0 - 'Der Präzisions-Synthesizer') ---")
+    print("Stelle deine Fragen an die Urteile UND Gesetze. (Beenden mit 'exit')")
     
     while True:
         try:
